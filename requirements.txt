@@ -1,0 +1,10 @@
+llama-index-core>=0.10.0
+llama-index-vector-stores-chroma
+llama-index-embeddings-huggingface
+chromadb
+pandas
+modelscope
+transformers
+torch
+accelerate
+gradio
