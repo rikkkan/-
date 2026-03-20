@@ -1,0 +1,114 @@
+import os
+import torch
+import chromadb
+import datetime
+from modelscope import snapshot_download
+from llama_index.core import VectorStoreIndex
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+class PsyQAEngine:
+    def __init__(self):
+        print("初始化系统引擎中，请稍候...")
+        os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+        
+        # 1. 加载本地向量库与检索器 (GTE-zh)
+        embed_model_dir = snapshot_download('iic/nlp_gte_sentence-embedding_chinese-base')
+        self.embed_model = HuggingFaceEmbedding(model_name=embed_model_dir)
+        
+        self.db_psy = chromadb.PersistentClient(path="./PsyDTCorpus_index")
+        
+        # [原有] 医疗知识库 Collection
+        self.chroma_collection = self.db_psy.get_collection("counseling_cases")
+        self.vector_store = ChromaVectorStore(chroma_collection=self.chroma_collection)
+        self.index = VectorStoreIndex.from_vector_store(self.vector_store, embed_model=self.embed_model)
+        self.retriever = self.index.as_retriever(similarity_top_k=3)
+        
+        # 长期记忆库 Collection（物理隔离，绝对不污染原生医患语料）
+        self.memory_collection = self.db_psy.get_or_create_collection("user_long_term_memory")
+        
+        # 2. 加载 Qwen 1.5 语言模型 (FP16半精度)
+        llm_dir = snapshot_download('qwen/Qwen1.5-4B-Chat')
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_dir)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            llm_dir, device_map="auto", torch_dtype=torch.float16
+        )
+        
+        # 定义短期滑动窗口的最大轮数
+        self.max_window_turns = 3 
+        
+        print("✅ 引擎初始化完成，Qwen与双轨记忆引擎已就位！")
+
+    def generate_reply(self, user_message, history):
+        """处理单次对话逻辑"""
+        
+        #  动作 1：检测滑动窗口溢出，并执行“异步向量落盘”
+        # 如果当前历史记录长度超过了滑动窗口限制，说明有最老的对话即将被丢弃
+        if len(history) > self.max_window_turns:
+            # 提取即将滑出窗口的最老一轮对话
+            dropped_human, dropped_assistant = history[-(self.max_window_turns + 1)]
+            archive_text = f"患者曾表述: {dropped_human} | 医生曾干预: {dropped_assistant}"
+            doc_id = f"mem_{datetime.datetime.now().timestamp()}"
+            
+            # 写入专属的记忆向量库（生产环境中这里可用 Celery 改为异步执行）
+            self.memory_collection.upsert(
+                documents=[archive_text],
+                metadatas=[{"type": "historical_memory", "date": str(datetime.date.today())}],
+                ids=[doc_id]
+            )
+
+        # A. 检索历史专家话术 (原生 RAG)
+        retrieved_nodes = self.retriever.retrieve(user_message)
+        reference_cases_str = ""
+        for i, node in enumerate(retrieved_nodes):
+            theory = node.metadata.get('theory', '通用支持')
+            doctor_words = node.metadata.get('doctor_responses', '倾听')
+            reference_cases_str += f"- 案例{i+1}: 理论[{theory}], 话术[{doctor_words}]\n"
+
+        # 动作 2：触发“时光机”，打捞长期记忆
+        long_term_context = ""
+        # 用当前的提问，去专属记忆库里搜寻远古记录
+        mem_results = self.memory_collection.query(
+            query_texts=[user_message],
+            n_results=1
+        )
+        if mem_results['documents'] and mem_results['documents'][0]:
+            hit_memory = mem_results['documents'][0][0]
+            long_term_context = f"\n【记忆外挂：该患者在历史干预中曾提及以下情况，请综合考虑】：\n{hit_memory}\n"
+
+        # B. 组装 System Prompt (将打捞的远古记忆无缝拼接入底座)
+        system_prompt = f"""你是一位拥有20年临床经验的顶级心理咨询师。
+你的任务是通过多轮对话引导来访者。
+【系统为你检索到的历史相似病历干预话术参考】：
+{reference_cases_str} {long_term_context}
+【最高指令约束】：
+1. 绝对不要长篇大论！每次只回复 1 到 3 句话！
+2. 不要急于给出建议！要顺着对方的话题进行共情。
+3. 你的回复结尾，通常应该是一个温和的、启发式的反问句。"""
+
+        # C. 历史记忆拼接 (动作 3：执行严格的滑动窗口截断)
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # 只切片截取最近的 `max_window_turns` 轮历史对话
+        recent_history = history[-self.max_window_turns:] if self.max_window_turns > 0 else []
+        for human, assistant in recent_history:
+            messages.append({"role": "user", "content": human})
+            messages.append({"role": "assistant", "content": assistant})
+            
+        messages.append({"role": "user", "content": user_message})
+
+        # D. 模型推理 (原生逻辑保持不变)
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        
+        generated_ids = self.model.generate(
+            model_inputs.input_ids, max_new_tokens=150, temperature=0.6, top_p=0.8
+        )
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        
+        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
