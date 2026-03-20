@@ -4,7 +4,7 @@ from qa_engine import PsyQAEngine
 
 print("正在启动 AI 心理咨询室后台服务...")
 
-# 实例化我们在 qa_engine.py 里写的引擎类
+# 实例化qa_engine.py 里写的引擎类
 # 这一步会把模型加载进显卡，只会执行一次！
 engine = PsyQAEngine()
 
@@ -21,6 +21,6 @@ demo = gr.ChatInterface(
 )
 
 if __name__ == "__main__":
-    print("🎉 Web 服务已就绪！")
+    print("Web 服务已就绪！")
     # 启动应用，server_name="0.0.0.0" 允许所有外部网络访问该端口
     demo.launch(share=True, server_name="0.0.0.0")
